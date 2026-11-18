@@ -2,11 +2,13 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # RustDesk 备份脚本 (青龙面板 webdav4 版)
+# cron: 40 3 * * *
 #
 # 功能：打包 docker-compose.yml + data + api_data(排除日志) -> 上传 WebDAV -> 清理旧备份
-# 依赖：webdav4  (青龙容器先 pip install webdav4)
+# 依赖：webdav4  (订阅后在依赖管理安装,或 pip install webdav4)
 # 挂载：rustdesk 目录挂到容器内 /source/rustdesk，或用 RUSTDESK_DIR 指定
 # 配置：全部环境变量及默认值见 .env.example
+# 订阅：ql repo <仓库地址> backup   (白名单 backup 同时匹配两个备份脚本)
 # ============================================================
 
 import os

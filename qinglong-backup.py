@@ -2,11 +2,13 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # 青龙面板备份脚本 (webdav4 版)
+# cron: 30 3 * * *
 #
 # 功能：打包选中目录 -> 上传 WebDAV -> 按 CLEANUP_POLICY 清理云端旧备份
-# 依赖：webdav4  (青龙容器先 pip install webdav4)
+# 依赖：webdav4  (订阅后在依赖管理安装,或 pip install webdav4)
 # 配置：全部环境变量及默认值见 .env.example
 # 上传：重试次数/指数退避间隔由 common 的 UPLOAD_RETRY / UPLOAD_RETRY_DELAY 控制
+# 订阅：ql repo <仓库地址> backup   (白名单 backup 同时匹配两个备份脚本)
 #
 # 【QL_BACKUP_INCLUDE 可填入别名，逗号分隔】别名映射清单：
 #   base      → db, upload        基础数据：数据库、上传文件
