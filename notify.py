@@ -6,6 +6,7 @@
 #
 # 功能：统一的通知入口,内部按渠道分发到具体平台。当前已实现:
 #   qywx - 企业微信群机器人 webhook
+#   mail - 邮件(SMTP,标准库实现)
 # 扩展：新增平台只需写一个 send_xxx 函数并加 @register 装饰器,
 #       调用方无需改动(见文件末尾"新增渠道示例")
 #
@@ -13,6 +14,14 @@
 # 配置：
 #   NOTIFY_CHANNEL      默认渠道,不传 -c 时使用,默认 qywx
 #   QYWX_WEBHOOK        企微群机器人 webhook,支持完整地址或仅填 key
+#   MAIL_HOST           SMTP 服务器,如 smtp.qq.com / smtp.163.com
+#   MAIL_PORT           SMTP 端口,默认 465
+#   MAIL_SSL            是否 SSL,默认端口 465 时 True、否则 False,可强制覆盖
+#   MAIL_STARTTLS       非 SSL 端口(如 587)是否 STARTTLS,默认 False
+#   MAIL_USER           SMTP 登录账号(一般就是发件邮箱)
+#   MAIL_PASS           SMTP 密码/授权码(公共邮箱必填;无需认证的内网 SMTP 可留空)
+#   MAIL_FROM           发件人,缺省取 MAIL_USER
+#   MAIL_TO             收件人,多个用英文逗号分隔
 #   NOTIFY_RETRY        失败重试次数,默认 3
 #   NOTIFY_RETRY_DELAY  重试基础间隔秒,默认 3 (指数退避)
 #
@@ -20,17 +29,22 @@
 #   python3 notify.py "测试消息"                       # 默认渠道,markdown
 #   python3 notify.py -c qywx -t text "纯文本消息"     # 指定渠道与消息类型
 #   python3 notify.py -c qywx -T "标题" "内容"
+#   python3 notify.py -c mail -T "备份完成" "详见附件日志"
 #   echo "内容" | python3 notify.py                    # 从管道读内容
 #   python3 notify.py --list                           # 查看已支持渠道
 #   其他脚本调用：
 #     from notify import send
 #     send('任务通知', '**备份完成**\n> 共 3 个文件')
-#     send('任务通知', '内容', channel='qywx')
+#     send('任务通知', '内容', channel='mail')
 # ============================================================
 
 import argparse
+import smtplib
 import sys
 import time
+from email.header import Header
+from email.mime.text import MIMEText
+from email.utils import formataddr
 
 import requests
 
@@ -67,19 +81,16 @@ def register(name: str, desc: str, required_env=()):
     return deco
 
 
-def _post_json(url: str, body: dict, ok_check, timeout: int = 15):
-    """POST JSON 并按 ok_check 判断业务成功,失败自动重试(指数退避)。
+def _run_with_retry(step_desc: str, func):
+    """带指数退避重试地执行 func,func 返回 True 视为成功。
 
-    返回 (成功与否, 最后一次响应 dict 或 None)。重试次数/间隔取环境变量。
+    func 内部自行抛异常或返回 False 均视为失败,统一记录日志并重试。
+    返回是否最终成功。
     """
-    data = None
     for attempt in range(NOTIFY_RETRY + 1):
         try:
-            resp = requests.post(url, json=body, timeout=timeout)
-            data = resp.json()
-            if ok_check(data):
-                return True, data
-            log(f'接口返回异常: {data}')
+            if func():
+                return True
         except Exception as e:
             log(f'第 {attempt + 1} 次请求失败: {str(e)}')
         if attempt >= NOTIFY_RETRY:
@@ -87,7 +98,25 @@ def _post_json(url: str, body: dict, ok_check, timeout: int = 15):
         wait = NOTIFY_RETRY_DELAY * (2 ** attempt)
         log(f'等待{wait}秒后重试...')
         time.sleep(wait)
-    return False, data
+    return False
+
+
+def _post_json(url: str, body: dict, ok_check, timeout: int = 15):
+    """POST JSON 并按 ok_check 判断业务成功,失败自动重试(指数退避)。
+
+    返回 (成功与否, 最后一次响应 dict 或 None)。重试次数/间隔取环境变量。
+    """
+    result = {'data': None}
+
+    def once():
+        resp = requests.post(url, json=body, timeout=timeout)
+        result['data'] = resp.json()
+        if ok_check(result['data']):
+            return True
+        log(f'接口返回异常: {result.get("data")}')
+        return False
+
+    return _run_with_retry('请求', once), result['data']
 
 
 # ===================== 渠道：企业微信 =====================
@@ -124,8 +153,55 @@ def send_qywx(title: str, content: str, msg_type: str = 'markdown') -> bool:
     return ok
 
 
-# 兼容旧调用名
-send_wechat_work = send_qywx
+
+# ===================== 渠道：邮件 =====================
+def _env_bool(key: str, default):
+    """读取布尔环境变量,支持 1/true/yes/on。"""
+    return env(key, default, lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on'))
+
+
+@register('mail', '邮件(SMTP)', ['MAIL_HOST', 'MAIL_TO'])
+def send_mail(title: str, content: str, msg_type: str = 'plain') -> bool:
+    """通过 SMTP 发送邮件。
+
+    msg_type: plain 或 html(默认 plain);标题即邮件主题
+    MAIL_PASS 为空时不登录,适合无需认证的内网 SMTP
+    """
+    if msg_type not in ('plain', 'html'):
+        raise ValueError(f'未知消息类型: {msg_type}，可选 plain/html')
+
+    user = env('MAIL_USER', '') or env('MAIL_TO', '').split(',')[0].strip()
+    password = env('MAIL_PASS', '')
+    sender = env('MAIL_FROM', '') or user
+    recipients = [addr.strip() for addr in
+                  env('MAIL_TO', '').replace('；', ',').replace(';', ',').split(',')
+                  if addr.strip()]
+    if not recipients:
+        raise RuntimeError('MAIL_TO 未配置有效的收件人地址')
+
+    host = env('MAIL_HOST', '')
+    port = env('MAIL_PORT', 465, int)
+    use_ssl = _env_bool('MAIL_SSL', port == 465)
+    use_starttls = _env_bool('MAIL_STARTTLS', False)
+
+    msg = MIMEText(content or title, msg_type, 'utf-8')
+    msg['Subject'] = Header(title, 'utf-8')
+    msg['From'] = formataddr((str(Header('青龙通知', 'utf-8')), sender))
+    msg['To'] = ', '.join(recipients)
+
+    def _deliver():
+        cls = smtplib.SMTP_SSL if use_ssl else smtplib.SMTP
+        with cls(host, port, timeout=20) as server:
+            if use_starttls:
+                server.starttls()
+            if password:
+                server.login(user, password)
+            server.sendmail(sender, recipients, msg.as_string())
+        return True
+
+    ok = _run_with_retry('发送', _deliver)
+    log(f'邮件已发送至 {", ".join(recipients)}' if ok else '邮件发送失败')
+    return ok
 
 
 # ===================== 统一入口 =====================
@@ -153,8 +229,8 @@ def main():
     parser = argparse.ArgumentParser(description='通用通知脚本(多平台可扩展)')
     parser.add_argument('-c', '--channel', default=None,
                         help='通知渠道,默认取 NOTIFY_CHANNEL 或 qywx')
-    parser.add_argument('-t', '--type', default='markdown',
-                        choices=['text', 'markdown'], help='消息类型,默认 markdown')
+    parser.add_argument('-t', '--type', default=None,
+                        help='消息类型,不传则用渠道默认(qywx=markdown, mail=plain)')
     parser.add_argument('-T', '--title', default='青龙通知', help='消息标题')
     parser.add_argument('--list', action='store_true', help='列出已支持的渠道')
     parser.add_argument('content', nargs='?', default='',
@@ -173,7 +249,8 @@ def main():
     if not content:
         content = '这是一条来自青龙面板的测试通知 ✅'
 
-    ok = send(args.title, content, channel=args.channel, msg_type=args.type)
+    ok = send(args.title, content, channel=args.channel,
+              **({'msg_type': args.type} if args.type else {}))
     sys.exit(0 if ok else 1)
 
 
